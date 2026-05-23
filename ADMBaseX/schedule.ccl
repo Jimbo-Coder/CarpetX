@@ -1,11 +1,22 @@
 # Schedule definitions for thorn ADMBaseX
 
 STORAGE: lapse[lapse_timelevels]
-STORAGE: shift[shift_timelevels]
 STORAGE: metric[metric_timelevels] curv[metric_timelevels]
 
-STORAGE: dtlapse[lapse_timelevels]
-STORAGE: dtshift[shift_timelevels]
+if (!CCTK_EQUALS(initial_shift, "none"))
+{
+  STORAGE: shift[shift_timelevels]
+}
+
+if (!CCTK_EQUALS(initial_dtlapse, "none"))
+{
+  STORAGE: dtlapse[lapse_timelevels]
+}
+
+if (!CCTK_EQUALS(initial_dtshift, "none"))
+{
+  STORAGE: dtshift[shift_timelevels]
+}
 
 if (CCTK_IsThornActive("ODESolvers")) {
 
@@ -114,29 +125,35 @@ if (CCTK_EQUALS(initial_dtshift, "zero")) {
 
 
 if (noise_amplitude != 0) {
-  # TODO: Also add noise during evolution?
-  # TODO: Noise should be added by a separate thorn.
+  if (!CCTK_EQUALS(initial_dtlapse, "none")) {
+    if (!CCTK_EQUALS(initial_shift, "none")) {
+      if (!CCTK_EQUALS(initial_dtshift, "none")) {
+        # TODO: Also add noise during evolution?
+        # TODO: Noise should be added by a separate thorn.
 
-  SCHEDULE ADMBaseX_add_noise IN ADMBaseX_PostInitial
-  {
-    LANG: C
-    READS: metric(interior)
-    READS: curv(interior)
-    READS: lapse(interior)
-    READS: dtlapse(interior)
-    READS: shift(interior)
-    READS: dtshift(interior)
-    WRITES: metric(interior)
-    WRITES: curv(interior)
-    WRITES: lapse(interior)
-    WRITES: dtlapse(interior)
-    WRITES: shift(interior)
-    WRITES: dtshift(interior)
-    SYNC: metric
-    SYNC: curv
-    SYNC: lapse
-    SYNC: dtlapse
-    SYNC: shift
-    SYNC: dtshift
-  } "Add noise to ADMBaseX variables"
+        SCHEDULE ADMBaseX_add_noise IN ADMBaseX_PostInitial
+        {
+          LANG: C
+          READS: metric(interior)
+          READS: curv(interior)
+          READS: lapse(interior)
+          READS: dtlapse(interior)
+          READS: shift(interior)
+          READS: dtshift(interior)
+          WRITES: metric(interior)
+          WRITES: curv(interior)
+          WRITES: lapse(interior)
+          WRITES: dtlapse(interior)
+          WRITES: shift(interior)
+          WRITES: dtshift(interior)
+          SYNC: metric
+          SYNC: curv
+          SYNC: lapse
+          SYNC: dtlapse
+          SYNC: shift
+          SYNC: dtshift
+        } "Add noise to ADMBaseX variables"
+      }
+    }
+  }
 }

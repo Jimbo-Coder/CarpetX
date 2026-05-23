@@ -25,13 +25,13 @@ KEYWORD initial_dtlapse "Initial dtlapse value"
 {
   "none" :: "Do not set up initial conditions"
   "zero" :: "Dtlapse is zero"
-} "zero"
+} "none"
 
 KEYWORD initial_dtshift "Initial dtshift value"
 {
   "none" :: "Do not set up initial conditions"
   "zero" :: "Dtshift is zero"
-} "zero"
+} "none"
 
 INT lapse_timelevels "Number of time levels for the lapse" STEERABLE=recover
 {
@@ -48,7 +48,41 @@ INT metric_timelevels "Number of time levels for the metric and extrinsic curvat
   0:3 :: ""
 } 1
 
+KEYWORD evolution_method "The metric and extrinsic curvature evolution method"
+{
+  "none" :: "The metric and extrinsic curvature are not evolved"
+  "static" :: "The metric and extrinsic curvature are not evolved"
+  "ID-apply-regrid" :: "The metric and extrinsic curvature are not evolved and initial data is used to fill in new grid points after regridding"
+  "ID-apply-always" :: "The metric and extrinsic curvature are not evolved and initial data is used to fill in new grid points before each step and after grid changes"
+} "static"
 
+KEYWORD lapse_evolution_method "The lapse evolution method"
+{
+  "static" :: "Lapse is not evolved"
+  "ID-apply-regrid" :: "Lapse is not evolved and initial data is used to fill in new grid points after regridding"
+  "ID-apply-always" :: "Lapse is not evolved and initial data is used to fill in new grid points before each step and after grid changes"
+} "static"
+
+KEYWORD shift_evolution_method "The shift evolution method"
+{
+  "static" :: "Shift is not evolved"
+  "ID-apply-regrid" :: "Shift is not evolved and initial data is used to fill in new grid points after regridding"
+  "ID-apply-always" :: "Shift is not evolved and initial data is used to fill in new grid points before each step and after grid changes"
+} "static"
+
+KEYWORD dtlapse_evolution_method "The dtlapse evolution method"
+{
+  "static" :: "Dtlapse is not evolved"
+  "ID-apply-regrid" :: "Dtlapse is not evolved and initial data is used to fill in new grid points after regridding"
+  "ID-apply-always" :: "Dtlapse is not evolved and initial data is used to fill in new grid points before each step and after grid changes"
+} "static"
+
+KEYWORD dtshift_evolution_method "The dtshift evolution method"
+{
+  "static" :: "Dtshift is not evolved"
+  "ID-apply-regrid" :: "Dtshift is not evolved and initial data is used to fill in new grid points after regridding"
+  "ID-apply-always" :: "Dtshift is not evolved and initial data is used to fill in new grid points before each step and after grid changes"
+} "static"
 
 PRIVATE:
 
