@@ -1,6 +1,8 @@
 #include "io_openpmd.hxx"
 
 #include "driver.hxx"
+#include "io_meta.hxx"
+#include "io_slice.hxx"
 #include "timer.hxx"
 
 #include <div.hxx>
@@ -40,6 +42,7 @@ static inline int omp_in_parallel() { return 0; }
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -364,8 +367,12 @@ struct carpetx_openpmd_t {
   ////////////////////////////////////////////////////////////////////////////////
 
   // Allowed characters are only [A-Za-z_]
+  // The optional `band` tag namespaces subcycling consumer-band meshes apart
+  // from the regular tl=0 data (see subcycling checkpoint/recovery). An empty
+  // tag (the default) leaves regular-data mesh names unchanged.
   static std::string make_meshname(const int gi, const int patch,
-                                   const int level, const int tl = 0) {
+                                   const int level, const int tl = 0,
+                                   const std::string &band = std::string()) {
     std::string groupname = CCTK_FullGroupName(gi);
     groupname = std::regex_replace(groupname, std::regex("::"), "_");
     for (auto &ch : groupname)
@@ -379,6 +386,8 @@ struct carpetx_openpmd_t {
       buf << "_lev" << setw(2) << setfill('0') << level;
     if (tl > 0)
       buf << "_tl" << setw(2) << setfill('0') << tl;
+    if (!band.empty())
+      buf << "_band_" << band;
     return buf.str();
   }
 
@@ -431,7 +440,8 @@ struct carpetx_openpmd_t {
                      const std::vector<bool> &output_group,
                      const std::string &output_dir,
                      const std::string &output_file,
-                     TimeLevelMode tl_mode = TimeLevelMode::Current);
+                     TimeLevelMode tl_mode = TimeLevelMode::Current,
+                     std::optional<slice_t> slice = std::nullopt);
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -464,11 +474,12 @@ void InputOpenPMD(const cGH *cctkGH, const std::vector<bool> &input_group,
 void OutputOpenPMD(const cGH *const cctkGH,
                    const std::vector<bool> &output_group,
                    const std::string &output_dir,
-                   const std::string &output_file, TimeLevelMode tl_mode) {
+                   const std::string &output_file, TimeLevelMode tl_mode,
+                   std::optional<slice_t> slice) {
   if (!carpetx_openpmd_t::self)
     carpetx_openpmd_t::self = std::make_optional<carpetx_openpmd_t>();
   carpetx_openpmd_t::self->OutputOpenPMD(cctkGH, output_group, output_dir,
-                                         output_file, tl_mode);
+                                         output_file, tl_mode, slice);
 }
 
 void ShutdownOpenPMD() { carpetx_openpmd_t::self.reset(); }
@@ -671,6 +682,8 @@ void carpetx_openpmd_t::InputOpenPMDGridStructure(cGH *cctkGH,
 
       amrex::BoxList boxlist(std::move(levboxes));
       amrex::BoxArray boxarray(std::move(boxlist));
+      if (rechop_on_recovery)
+        boxarray = patchdata.amrcore->RechopLevel(level, boxarray);
       patchdata.amrcore->SetBoxArray(level, boxarray);
 
       amrex::DistributionMapping dm(boxarray);
@@ -1091,6 +1104,77 @@ void carpetx_openpmd_t::InputOpenPMD(const cGH *const cctkGH,
                                                       : make_valid_int(),
                   []() { return "read from openPMD file"; });
           } // for tl
+
+          // Subcycling consumer bands (see OutputOpenPMD): zero-ghost MultiFabs
+          // sharing the level's idomain frame. Guard on mesh existence so
+          // synchronized/old checkpoints leave the rebuilt band untouched.
+          {
+            const auto read_band = [&](amrex::MultiFab *const band,
+                                       const band_kind kind, const int stage) {
+              if (!band || band->empty())
+                return;
+              assert(band->nGrowVect() == 0);
+              const std::string band_tag = subcycling_band_tag(kind, stage);
+              const std::string meshname = make_meshname(
+                  gi, leveldata.patch, leveldata.level, 0, band_tag);
+              if (!read_iter->meshes.count(meshname))
+                return; // old/synchronized checkpoint: no band data
+              if (io_verbose)
+                CCTK_VINFO("Reading band mesh %s...", meshname.c_str());
+              const openPMD::Mesh &mesh = read_iter->meshes.at(meshname);
+
+              std::vector<openPMD::MeshRecordComponent> record_components;
+              record_components.reserve(numvars);
+              openPMD::Extent extent;
+              for (int vi = 0; vi < numvars; ++vi) {
+                const std::string componentname = make_componentname(gi, vi);
+                assert(mesh.count(componentname));
+                record_components.push_back(mesh.at(componentname));
+                if (vi == 0)
+                  extent = record_components.back().getExtent();
+              }
+              assert(int(record_components.size()) == numvars);
+
+              const int num_local_components = band->local_size();
+              for (int local_component = 0;
+                   local_component < num_local_components; ++local_component) {
+                const int component = band->IndexArray().at(local_component);
+
+                const amrex::Box &fabbox =
+                    band->fabbox(component); // zero ghost
+                const box_t<int, 3> box{
+                    .lo = {fabbox.smallEnd(0), fabbox.smallEnd(1),
+                           fabbox.smallEnd(2)},
+                    .hi = {fabbox.bigEnd(0) + 1, fabbox.bigEnd(1) + 1,
+                           fabbox.bigEnd(2) + 1}};
+
+                const openPMD::Offset start =
+                    to_vector(reversed(box.lo - idomain.lo));
+                const openPMD::Extent count = to_vector(reversed(box.shape()));
+                const int np = box.size();
+                assert(int(count.at(0) * count.at(1) * count.at(2)) == np);
+                for (int d = 0; d < 3; ++d)
+                  assert(start.at(d) + count.at(d) <= extent.at(d));
+
+                amrex::FArrayBox &fab = (*band)[component];
+                for (int vi = 0; vi < numvars; ++vi) {
+                  CCTK_REAL *const ptr = fab.dataPtr() + vi * np;
+#if OPENPMDAPI_VERSION_GE(0, 15, 0)
+                  record_components.at(vi).loadChunkRaw(ptr, start, count);
+#else
+                  record_components.at(vi).loadChunk(openPMD::shareRaw(ptr),
+                                                     start, count);
+#endif
+                } // for vi
+              } // for local_component
+            };
+
+            for (int s = 0; s < max_num_rk_stages; ++s)
+              read_band(groupdata.ks_consumer_band[s].get(),
+                        band_kind::ks_consumer, s);
+            read_band(groupdata.old_consumer_band.get(),
+                      band_kind::old_consumer, -1);
+          }
         }
       } // for gi
 
@@ -1372,7 +1456,8 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
                                       const std::vector<bool> &output_group,
                                       const std::string &output_dir,
                                       const std::string &output_file,
-                                      TimeLevelMode tl_mode) {
+                                      TimeLevelMode tl_mode,
+                                      std::optional<slice_t> slice) {
   DECLARE_CCTK_ARGUMENTS;
   DECLARE_CCTK_PARAMETERS;
 
@@ -1425,10 +1510,16 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
                                                  MPI_COMM_WORLD, options);
     series->setIterationEncoding(iterationEncoding);
 
+    // Series metadata must be rank-identical (HDF5 metadata writes are
+    // collective): broadcast rank 0's author and hostname.
     {
+      char author[1000] = {0};
       char const *const user = getenv("USER");
       if (user)
-        series->setAuthor(user);
+        std::snprintf(author, sizeof author, "%s", user);
+      MPI_Bcast(author, sizeof author, MPI_CHAR, 0, MPI_COMM_WORLD);
+      if (author[0])
+        series->setAuthor(author);
     }
     // Software is always "openPMD-api"
     // series->setSoftware("Einstein Toolkit <https://einsteintoolkit.org>");
@@ -1442,6 +1533,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
     {
       char hostname[1000];
       Util_GetHostName(hostname, sizeof hostname);
+      MPI_Bcast(hostname, sizeof hostname, MPI_CHAR, 0, MPI_COMM_WORLD);
       series->setMachine(hostname);
     }
 
@@ -1462,15 +1554,23 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
   const int myproc = CCTK_MyProc(cctkGH);
   const int ioproc = 0;
 
+  // At an unsynchronized subcycling checkpoint the fine consumer bands hold
+  // mid-cycle state that exists nowhere else and must be serialized. Otherwise
+  // the on-disk format is unchanged.
+  const bool write_bands = !all_levels_synchronized();
+
+  // Iteration attributes are set on EVERY rank (all inputs are replicated):
+  // rank-asymmetric writes deadlock the HDF5 backend's collective metadata.
+
   // Write parameters
-  if (myproc == ioproc) {
+  {
     char *const data = IOUtil_GetAllParameters(cctkGH, 1 /*all*/);
     const std::string parameters(data);
     std::free(data);
     write_iter.setAttribute("AllParameters", parameters);
   }
 
-  if (myproc == ioproc) {
+  if (!slice) {
     const int ndims = Loop::dim;
     write_iter.setAttribute<std::int64_t>("numDims", ndims);
     const int npatches = ghext->patchdata.size();
@@ -1526,7 +1626,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
             static_cast<std::int64_t>(leveldata.iteration.den));
       }
     }
-  } // if ioproc
+  } // if !slice
 
   // First write grid functions in a loop over patches and levels
 
@@ -1557,13 +1657,28 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
       const amrex::IntVect &ihi = dom.bigEnd();
       // The domain is always vertex centred. The tensor components are
       // then staggered if necessary.
-      const box_t<int, 3> idomain{
+      box_t<int, 3> idomain{
           .lo = {ilo[0] - output_ghosts * nghosts[0],
                  ilo[1] - output_ghosts * nghosts[1],
                  ilo[2] - output_ghosts * nghosts[2]},
           .hi = {ihi[0] + output_ghosts * nghosts[0] + 1 + 1,
                  ihi[1] + output_ghosts * nghosts[1] + 1 + 1,
                  ihi[2] + output_ghosts * nghosts[2] + 1 + 1}};
+      // When slicing, restrict the (vertex-centred) domain to a thickness-1
+      // slab at the plane. The same x0/dx frame is reused for every
+      // per-component box below so all scopes pick the same integer plane.
+      // restrict_box tests exterior bounds; this matches restrict_box_interior
+      // only because output_ghosts is false (box == intbox).
+      const Arith::vect<CCTK_REAL, 3> slice_x0{xlo[0], xlo[1], xlo[2]};
+      const Arith::vect<CCTK_REAL, 3> slice_dx{dx[0], dx[1], dx[2]};
+      if (slice) {
+        const auto r =
+            slice->restrict_box(idomain.lo, idomain.hi, slice_x0, slice_dx);
+        if (!r)
+          continue; // plane misses this (patch, level) entirely
+        idomain.lo = r->first;
+        idomain.hi = r->second;
+      }
       if (io_verbose) {
         CCTK_VINFO("Patch: %d, Level: %d", patchdata.patch, leveldata.level);
         CCTK_VINFO("  xmin: [%f,%f,%f]", double(rdomain.lo[0]),
@@ -1722,10 +1837,38 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
               // It seems that openPMD assumes that chunks do not have
               // ghost zones
               assert(!output_ghosts);
-              const box_t<int, 3> &box = output_ghosts ? extbox : intbox;
+              box_t<int, 3> box = output_ghosts ? extbox : intbox;
+              // Restrict this component to the thickness-1 slab, skipping
+              // components that miss the plane. Membership is cell-canonical so
+              // cell and vertex variables pick the same components for the
+              // shared vertex-framed dataset.
+              if (slice) {
+                const amrex::Box cvalidbox = amrex::enclosedCells(validbox);
+                const Arith::vect<int, 3> cval_lo{cvalidbox.smallEnd(0),
+                                                  cvalidbox.smallEnd(1),
+                                                  cvalidbox.smallEnd(2)};
+                const Arith::vect<int, 3> cval_hi{cvalidbox.bigEnd(0) + 1,
+                                                  cvalidbox.bigEnd(1) + 1,
+                                                  cvalidbox.bigEnd(2) + 1};
+                const auto r = slice->restrict_component(
+                    box.lo, box.hi, cval_lo, cval_hi, slice_x0, slice_dx,
+                    is_cell_centred);
+                if (!r)
+                  continue; // this component does not intersect the plane
+                box.lo = r->first;
+                box.hi = r->second;
+              }
 
-              const openPMD::Offset start =
-                  to_vector(reversed(box.lo - idomain.lo));
+              Arith::vect<int, 3> start_vec = box.lo - idomain.lo;
+              if (slice) {
+                const int n = slice->normal_dir;
+                // The slab must fall inside this component's exterior extent.
+                assert(box.lo[n] >= extbox.lo[n] && box.hi[n] <= extbox.hi[n]);
+                // idomain is vertex-framed, so box.lo - idomain.lo is wrong for
+                // the thickness-1 slab; force the normal offset to 0.
+                start_vec[n] = 0;
+              }
+              const openPMD::Offset start = to_vector(reversed(start_vec));
               const openPMD::Extent count = to_vector(reversed(box.shape()));
               const int np = box.size();
               assert(int(count.at(0) * count.at(1) * count.at(2)) == np);
@@ -1740,7 +1883,8 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
 
               const amrex::FArrayBox &fab = mfab[component];
               for (int vi = 0; vi < numvars; ++vi) {
-                if (output_ghosts || intbox == extbox) {
+                // A thin slab (box != extbox) takes the contiguous-copy path.
+                if (box == extbox) {
                   const CCTK_REAL *const ptr = fab.dataPtr() + vi * np;
 #if OPENPMDAPI_VERSION_GE(0, 15, 0)
                   record_components.at(vi).storeChunkRaw(ptr, start, count);
@@ -1751,46 +1895,119 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
                 } else {
                   std::shared_ptr<CCTK_REAL> ptr(
                       new CCTK_REAL[np], std::default_delete<CCTK_REAL[]>());
-                  const Arith::vect<int, 3> amrex_shape = extbox.shape();
-                  const Arith::vect<int, 3> amrex_offset = box.lo - extbox.lo;
-                  constexpr int amrex_di = 1;
-                  const int amrex_dj = amrex_di * amrex_shape[0];
-                  const int amrex_dk = amrex_dj * amrex_shape[1];
-                  const int amrex_np = amrex_dk * amrex_shape[2];
-                  const CCTK_REAL *restrict const amrex_ptr =
-                      fab.dataPtr() + vi * amrex_np +
-                      amrex_di * amrex_offset[0] + amrex_dj * amrex_offset[1] +
-                      amrex_dk * amrex_offset[2];
-                  const Arith::vect<int, 3> contig_shape = box.shape();
-                  constexpr int contig_di = 1;
-                  const int contig_dj = contig_di * contig_shape[0];
-                  const int contig_dk = contig_dj * contig_shape[1];
-                  const int contig_np = contig_dk * contig_shape[2];
-                  assert(contig_np == np);
-                  CCTK_REAL *restrict const contig_ptr = ptr.get();
-                  for (int k = 0; k < contig_shape[2]; ++k)
-                    for (int j = 0; j < contig_shape[1]; ++j)
-#pragma omp simd
-                      for (int i = 0; i < contig_shape[0]; ++i)
-                        contig_ptr[contig_di * i + contig_dj * j +
-                                   contig_dk * k] =
-                            amrex_ptr[amrex_di * i + amrex_dj * j +
-                                      amrex_dk * k];
+                  extract_subbox(ptr.get(), fab.dataPtr() + vi * extbox.size(),
+                                 extbox.lo, extbox.hi, box.lo, box.hi);
                   record_components.at(vi).storeChunk(std::move(ptr), start,
                                                       count);
                 }
               } // for vi
             } // for local_component
           } // for tl
+
+          // Subcycling consumer bands: zero-ghost MultiFabs in this level's
+          // index space, so they share the level's idomain frame and dataset
+          // extent and write a sparse subset of chunks. Geometry is rebuilt on
+          // recovery; we serialize only the data, namespaced by a band tag.
+          // 2D slices emit only the main grid data; bands remain 3D-only.
+          if (write_bands && !slice) {
+            const auto write_band = [&](const amrex::MultiFab *const band,
+                                        const band_kind kind, const int stage) {
+              if (!band || band->empty())
+                return;
+              assert(band->nGrowVect() == 0);
+              const std::string band_tag = subcycling_band_tag(kind, stage);
+
+              const amrex::IndexType &indextype = band->ixType();
+              const Arith::vect<bool, 3> is_cell_centred{
+                  indextype.cellCentered(0), indextype.cellCentered(1),
+                  indextype.cellCentered(2)};
+
+              const std::string meshname = make_meshname(
+                  gi, leveldata.patch, leveldata.level, 0, band_tag);
+              if (io_verbose)
+                CCTK_VINFO("Defining band mesh %s...", meshname.c_str());
+              assert(!write_iter.meshes.contains(meshname));
+              openPMD::Mesh mesh = write_iter.meshes[meshname];
+
+              mesh.setGeometry(openPMD::Mesh::Geometry::cartesian);
+              mesh.setAxisLabels(
+                  reversed(std::vector<std::string>{"x", "y", "z"}));
+              mesh.setGridSpacing(to_vector<CCTK_REAL>(reversed(
+                  fmap([](auto x, auto y) { return x / CCTK_REAL(y); },
+                       rdomain.hi - rdomain.lo, idomain.shape() - 1))));
+              mesh.setGridGlobalOffset(to_vector<double>(reversed(rdomain.lo)));
+              mesh.setGridUnitSI(Unit::length);
+              mesh.setTimeOffset(CCTK_REAL(0));
+
+              const Arith::vect<double, 3> position =
+                  fmap([](auto c) { return 0.5 * c; }, is_cell_centred);
+
+              std::vector<openPMD::MeshRecordComponent> record_components;
+              record_components.reserve(numvars);
+              for (int vi = 0; vi < numvars; ++vi) {
+                const std::string componentname = make_componentname(gi, vi);
+                record_components.push_back(mesh[componentname]);
+                auto &record_component = record_components.back();
+                record_component.setPosition(
+                    to_vector<double>(reversed(position)));
+              }
+              assert(int(record_components.size()) == numvars);
+              for (int vi = 0; vi < numvars; ++vi)
+                record_components.at(vi).resetDataset(dataset);
+
+              const int num_local_components = band->local_size();
+              for (int local_component = 0;
+                   local_component < num_local_components; ++local_component) {
+                const int component = band->IndexArray().at(local_component);
+
+                const amrex::Box &fabbox =
+                    band->fabbox(component); // zero ghost
+                const box_t<int, 3> box{
+                    .lo = {fabbox.smallEnd(0), fabbox.smallEnd(1),
+                           fabbox.smallEnd(2)},
+                    .hi = {fabbox.bigEnd(0) + 1, fabbox.bigEnd(1) + 1,
+                           fabbox.bigEnd(2) + 1}};
+
+                const openPMD::Offset start =
+                    to_vector(reversed(box.lo - idomain.lo));
+                const openPMD::Extent count = to_vector(reversed(box.shape()));
+                const int np = box.size();
+                assert(int(count.at(0) * count.at(1) * count.at(2)) == np);
+                for (int d = 0; d < 3; ++d)
+                  assert(start.at(d) + count.at(d) <= extent.at(d));
+
+                const amrex::FArrayBox &fab = (*band)[component];
+                for (int vi = 0; vi < numvars; ++vi) {
+                  const CCTK_REAL *const ptr = fab.dataPtr() + vi * np;
+#if OPENPMDAPI_VERSION_GE(0, 15, 0)
+                  record_components.at(vi).storeChunkRaw(ptr, start, count);
+#else
+                  record_components.at(vi).storeChunk(openPMD::shareRaw(ptr),
+                                                      start, count);
+#endif
+                } // for vi
+              } // for local_component
+            };
+
+            for (int s = 0; s < max_num_rk_stages; ++s)
+              write_band(groupdata.ks_consumer_band[s].get(),
+                         band_kind::ks_consumer, s);
+            write_band(groupdata.old_consumer_band.get(),
+                       band_kind::old_consumer, -1);
+          } // if write_bands
         }
       } // for gi
 
     } // for leveldata
   } // for patchdata
 
-  // Next write grid scalars and grid arrays
+  // Next write grid scalars and grid arrays.
+  // Slices emit only GF data; a non-GF group in out_openpmd_2d_vars produces
+  // nothing here.
 
-  if (myproc == ioproc) {
+  // Mesh and dataset definitions are collective (HDF5); only the data write
+  // below is restricted to a single rank (the data is replicated).
+  if (!slice) {
     const int numgroups = CCTK_NumGroups();
     for (int gi = 0; gi < numgroups; ++gi) {
       if (output_group.at(gi)) {
@@ -1920,78 +2137,104 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
         assert(cactus_dk > 0);
         assert(cactus_np > 0);
         assert(int(groupdata.data.at(tl).size()) == numvars * cactus_np);
-        for (int vi = 0; vi < numvars; ++vi) {
-          const void *const var_ptr =
-              groupdata.data.at(tl).data_at(vi * cactus_np);
-          if (output_ghosts || intbox == extbox) {
+        // Replicated data; only one rank writes.
+        if (myproc == ioproc) {
+          for (int vi = 0; vi < numvars; ++vi) {
+            const void *const var_ptr =
+                groupdata.data.at(tl).data_at(vi * cactus_np);
+            if (output_ghosts || intbox == extbox) {
 #if !OPENPMDAPI_VERSION_GE(0, 15, 0)
 #define storeChunkRaw(ptr, start, count)                                       \
   storeChunk(openPMD::shareRaw(ptr), start, count)
 #endif
-            switch (cgroup.vartype) {
-            case CCTK_VARIABLE_REAL:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_REAL const *>(var_ptr), start, count);
-              break;
-            case CCTK_VARIABLE_INT:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_INT const *>(var_ptr), start, count);
-              break;
-            case CCTK_VARIABLE_COMPLEX:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_COMPLEX const *>(var_ptr), start, count);
-              break;
-            default:
-              assert(0 && "Unexpected variable type");
+              switch (cgroup.vartype) {
+              case CCTK_VARIABLE_REAL:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_REAL const *>(var_ptr), start, count);
+                break;
+              case CCTK_VARIABLE_INT:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_INT const *>(var_ptr), start, count);
+                break;
+              case CCTK_VARIABLE_COMPLEX:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_COMPLEX const *>(var_ptr), start, count);
+                break;
+              default:
+                assert(0 && "Unexpected variable type");
+              }
+            } else {
+              auto cactus_ptr = &groupdata.data.at(tl);
+              const Arith::vect<int, 3> contig_shape = box.shape();
+              constexpr int contig_di = 1;
+              const int contig_dj = contig_di * contig_shape[0];
+              const int contig_dk = contig_dj * contig_shape[1];
+              const int contig_np = contig_dk * contig_shape[2];
+              assert(contig_np == np);
+              auto contig_ptr =
+                  new GHExt::GlobalData::AnyTypeVector(cgroup.vartype, np);
+              for (int k = 0; k < contig_shape[2]; ++k)
+                for (int j = 0; j < contig_shape[1]; ++j)
+                  for (int i = 0; i < contig_shape[0]; ++i)
+                    // TODO: copy whole contiguous strip at once
+                    memcpy(contig_ptr->data_at(contig_di * i + contig_dj * j +
+                                               contig_dk * k),
+                           cactus_ptr->data_at(cactus_di * i + cactus_dj * j +
+                                               cactus_dk * k + vi * cactus_np),
+                           CCTK_VarTypeSize(cgroup.vartype));
+              switch (cgroup.vartype) {
+              case CCTK_VARIABLE_REAL:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_REAL>(
+                        static_cast<CCTK_REAL *>(contig_ptr->data_at(0)),
+                        [=](CCTK_REAL *) { delete contig_ptr; }),
+                    start, count);
+                break;
+              case CCTK_VARIABLE_INT:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_INT>(
+                        static_cast<CCTK_INT *>(contig_ptr->data_at(0)),
+                        [=](CCTK_INT *const) { delete contig_ptr; }),
+                    start, count);
+                break;
+              case CCTK_VARIABLE_COMPLEX:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_COMPLEX>(
+                        static_cast<CCTK_COMPLEX *>(contig_ptr->data_at(0)),
+                        [=](CCTK_COMPLEX *const) { delete contig_ptr; }),
+                    start, count);
+                break;
+              default:
+                assert(0 && "Unexpected variable type");
+              }
             }
-          } else {
-            auto cactus_ptr = &groupdata.data.at(tl);
-            const Arith::vect<int, 3> contig_shape = box.shape();
-            constexpr int contig_di = 1;
-            const int contig_dj = contig_di * contig_shape[0];
-            const int contig_dk = contig_dj * contig_shape[1];
-            const int contig_np = contig_dk * contig_shape[2];
-            assert(contig_np == np);
-            auto contig_ptr =
-                new GHExt::GlobalData::AnyTypeVector(cgroup.vartype, np);
-            for (int k = 0; k < contig_shape[2]; ++k)
-              for (int j = 0; j < contig_shape[1]; ++j)
-                for (int i = 0; i < contig_shape[0]; ++i)
-                  // TODO: copy whole contiguous strip at once
-                  memcpy(contig_ptr->data_at(contig_di * i + contig_dj * j +
-                                             contig_dk * k),
-                         cactus_ptr->data_at(cactus_di * i + cactus_dj * j +
-                                             cactus_dk * k + vi * cactus_np),
-                         CCTK_VarTypeSize(cgroup.vartype));
-            switch (cgroup.vartype) {
-            case CCTK_VARIABLE_REAL:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_REAL>(
-                      static_cast<CCTK_REAL *>(contig_ptr->data_at(0)),
-                      [=](CCTK_REAL *) { delete contig_ptr; }),
-                  start, count);
-              break;
-            case CCTK_VARIABLE_INT:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_INT>(
-                      static_cast<CCTK_INT *>(contig_ptr->data_at(0)),
-                      [=](CCTK_INT *const) { delete contig_ptr; }),
-                  start, count);
-              break;
-            case CCTK_VARIABLE_COMPLEX:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_COMPLEX>(
-                      static_cast<CCTK_COMPLEX *>(contig_ptr->data_at(0)),
-                      [=](CCTK_COMPLEX *const) { delete contig_ptr; }),
-                  start, count);
-              break;
-            default:
-              assert(0 && "Unexpected variable type");
-            }
-          }
-        } // for vi
+          } // for vi
+        }
       }
     }
+  }
+
+  // Record the two in-plane axes for the slice files (3D path registers
+  // nothing).
+  if (slice && CCTK_MyProc(nullptr) == 0) {
+    output_file_description_t ofd;
+    ofd.filename = *filename;
+    ofd.description = "2D CarpetX openPMD slice output";
+    ofd.writer_thorn = CCTK_THORNSTRING;
+    for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+      if (!output_group.at(gi) || CCTK_GroupTypeI(gi) != CCTK_GF)
+        continue;
+      const int numvars = CCTK_NumVarsInGroupI(gi);
+      const int firstvar = CCTK_FirstVarIndexI(gi);
+      for (int vi = 0; vi < numvars; ++vi)
+        ofd.variables.push_back(CCTK_FullVarName(firstvar + vi));
+    }
+    ofd.iterations = {cctk_iteration};
+    for (const int d : slice->inplane_dirs())
+      ofd.output_directions.push_back(d);
+    ofd.format_name = "CarpetX/openPMD";
+    ofd.format_version = {1, 0, 0};
+    OutputMeta_RegisterOutputFile(std::move(ofd));
   }
 
   if (io_verbose)

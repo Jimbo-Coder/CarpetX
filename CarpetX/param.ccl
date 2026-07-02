@@ -99,7 +99,7 @@ BOOLEAN periodic_z "Periodic boundary conditions in z-direction"
   "no"  :: "not periodic in z direction"
 } "yes"
 
-BOOLEAN use_subcycling_wip "Use subcycling in time"
+BOOLEAN use_subcycling "Use subcycling in time"
 {
 } "no"
 
@@ -375,6 +375,10 @@ BOOLEAN refine_grid_layout "Ensure that each MPI process has at least one grid" 
 {
 } yes
 
+BOOLEAN rechop_on_recovery "Re-chop and load-balance the grid to the current max_grid_size / node count when recovering from a checkpoint (openPMD only)" STEERABLE=recover
+{
+} no
+
 CCTK_INT max_tile_size_x "Maximum tile size" STEERABLE=recover
 {
   1:* :: ""
@@ -630,6 +634,18 @@ INT out_openpmd_every "Output in openPMD format every that many iterations" STEE
   1:* :: "every that many iterations"
 } -1
 
+STRING out_openpmd_2d_vars "Variables to output as 2D planar slices in openPMD format" STEERABLE=always
+{
+  ".*" :: ""
+} ""
+
+INT out_openpmd_2d_every "Output 2D openPMD slices every that many iterations" STEERABLE=always
+{
+  -1 :: "use value of IO::out_every"
+  0 :: "never output 2D openPMD"
+  1:* :: "every that many iterations"
+} -1
+
 
 
 STRING out_plotfile_groups "Groups to output as AMReX plotfile" STEERABLE=always
@@ -655,6 +671,18 @@ INT out_silo_every "Output in Silo format every that many iterations" STEERABLE=
 {
   -1 :: "use value of IO::out_every"
   0 :: "never output Silo"
+  1:* :: "every that many iterations"
+} -1
+
+STRING out_silo_2d_vars "Variables to output as 2D planar slices in Silo format" STEERABLE=always
+{
+  ".*" :: ""
+} ""
+
+INT out_silo_2d_every "Output 2D Silo slices every that many iterations" STEERABLE=always
+{
+  -1 :: "use value of IO::out_every"
+  0 :: "never output 2D Silo"
   1:* :: "every that many iterations"
 } -1
 
@@ -724,3 +752,7 @@ USES CCTK_REAL out_yline_x
 USES CCTK_REAL out_yline_z
 USES CCTK_REAL out_zline_x
 USES CCTK_REAL out_zline_y
+
+USES CCTK_REAL out_xyplane_z
+USES CCTK_REAL out_xzplane_y
+USES CCTK_REAL out_yzplane_x

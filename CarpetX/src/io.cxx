@@ -5,6 +5,7 @@
 #include "io_norm.hxx"
 #include "io_openpmd.hxx"
 #include "io_silo.hxx"
+#include "io_slice.hxx"
 #include "io_tsv.hxx"
 #include "schedule.hxx"
 #include "timer.hxx"
@@ -14,6 +15,7 @@
 
 #include <cctk.h>
 #include <cctk_Arguments.h>
+#include <cctk_IOMethods.h>
 #include <cctk_Parameters.h>
 #include <util_Table.h>
 
@@ -147,6 +149,11 @@ void RecoverGridStructure(cGH *restrict cctkGH) {
   DECLARE_CCTK_ARGUMENTS;
   DECLARE_CCTK_PARAMETERS;
 
+  if (rechop_on_recovery && !CCTK_EQUALS(recover_method, "openpmd"))
+    CCTK_VERROR("CarpetX::rechop_on_recovery is only supported for "
+                "recover_method=\"openpmd\" (got \"%s\")",
+                recover_method);
+
   if (CCTK_EQUALS(recover_method, "openpmd")) {
 
 #ifdef HAVE_CAPABILITY_openPMD_api
@@ -211,6 +218,22 @@ void RecoverGH(const cGH *restrict cctkGH) {
     }
     return enabled;
   }();
+
+  // Rebuild the consumer-band geometry (deterministic, not serialized) so the
+  // band read below has somewhere to land. All levels exist here, so source
+  // geometry (reads level+1) is valid; build_bands is a no-op for non-evolved
+  // groups.
+  if (ghext->use_subcycling) {
+    for (const auto &patchdata : ghext->patchdata)
+      for (const auto &leveldata : patchdata.leveldata)
+        for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+          if (CCTK_GroupTypeI(gi) != CCTK_GF)
+            continue;
+          const auto *const gd = leveldata.groupdata.at(gi).get();
+          if (gd)
+            leveldata.build_bands(*gd);
+        }
+  }
 
   if (CCTK_EQUALS(recover_method, "openpmd")) {
 
@@ -578,6 +601,29 @@ int OutputGH(const cGH *restrict cctkGH) {
   }
 
   {
+    const int every =
+        out_openpmd_2d_every == -1 ? out_every : out_openpmd_2d_every;
+    if (every > 0 && cctk_iteration % every == 0) {
+      const std::vector<bool> group_enabled =
+          find_groups("openPMD-2D", out_openpmd_2d_vars);
+#ifdef HAVE_CAPABILITY_openPMD_api
+      const std::string simulation_name = get_simulation_name();
+      // xy plane: normal = z; xz: normal = y; yz: normal = x
+      OutputOpenPMD(cctkGH, group_enabled, out_dir, simulation_name + ".xy",
+                    TimeLevelMode::Current, slice_t{2, out_xyplane_z});
+      OutputOpenPMD(cctkGH, group_enabled, out_dir, simulation_name + ".xz",
+                    TimeLevelMode::Current, slice_t{1, out_xzplane_y});
+      OutputOpenPMD(cctkGH, group_enabled, out_dir, simulation_name + ".yz",
+                    TimeLevelMode::Current, slice_t{0, out_yzplane_x});
+#else
+      if (strlen(out_openpmd_2d_vars) != 0)
+        CCTK_VERROR("openPMD is not enabled. The parameter "
+                    "CarpetX::out_openpmd_2d_vars must be empty.");
+#endif
+    }
+  }
+
+  {
     const int every = out_plotfile_every == -1 ? out_every : out_plotfile_every;
     if (every > 0 && cctk_iteration % every == 0)
       OutputPlotfile(cctkGH);
@@ -601,12 +647,45 @@ int OutputGH(const cGH *restrict cctkGH) {
     }
   }
 
+  {
+    const int every = out_silo_2d_every == -1 ? out_every : out_silo_2d_every;
+    if (every > 0 && cctk_iteration % every == 0) {
+      const std::vector<bool> group_enabled =
+          find_groups("Silo-2D", out_silo_2d_vars);
+#ifdef HAVE_CAPABILITY_Silo
+      const std::string simulation_name = get_simulation_name();
+      // xy plane: normal = z; xz: normal = y; yz: normal = x
+      OutputSilo(cctkGH, group_enabled, out_dir, simulation_name + ".xy",
+                 slice_t{2, out_xyplane_z});
+      OutputSilo(cctkGH, group_enabled, out_dir, simulation_name + ".xz",
+                 slice_t{1, out_xzplane_y});
+      OutputSilo(cctkGH, group_enabled, out_dir, simulation_name + ".yz",
+                 slice_t{0, out_yzplane_x});
+#else
+      if (strlen(out_silo_2d_vars) != 0)
+        CCTK_VERROR("Silo is not enabled. The parameter "
+                    "CarpetX::out_silo_2d_vars must be empty.");
+#endif
+    }
+  }
+
   OutputTSVold(cctkGH);
 
   {
     const int every = out_tsv_every == -1 ? out_every : out_tsv_every;
     if (every > 0 && cctk_iteration % every == 0)
       OutputTSV(cctkGH);
+  }
+
+  // Call the IO methods registered via CCTK_RegisterIOMethod; the flesh's
+  // default traversal never runs since CCTK_OutputGH is overloaded.
+  {
+    const int num_methods = CCTK_NumIOMethods();
+    for (int handle = 0; handle < num_methods; ++handle) {
+      const IOMethod *const method = CCTK_IOMethod(handle);
+      if (method && method->OutputGH)
+        method->OutputGH(cctkGH);
+    }
   }
 
   // Describe all output files

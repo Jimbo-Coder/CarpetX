@@ -18,6 +18,7 @@
 
 #include <AMReX.H>
 #include <AMReX_BCRec.H>
+#include <AMReX_FillPatchUtil.H>
 #include <AMReX_ParmParse.H>
 
 #include <omp.h>
@@ -29,7 +30,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -989,6 +992,146 @@ amrex::iMultiFab *GHExt::PatchData::LevelData::get_cf_mask(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void GHExt::PatchData::LevelData::build_bands(
+    const GroupData &groupdata) const {
+  // Bands only exist for evolved groups under subcycling.
+  if (!ghext->use_subcycling || !groupdata.do_evolve)
+    return;
+
+  const std::array<int, dim> &indextype = groupdata.indextype;
+  // Sharing assumption (as for cf_masks): all groups of this centering at this
+  // level use the same nghostzones and interpolator, so the band geometry can
+  // be cached per (level, centering).
+  const int s = (indextype[0] << 2) | (indextype[1] << 1) | indextype[2];
+
+  const auto &patchdata = ghext->patchdata.at(patch);
+  const amrex::IntVect ratio{2, 2, 2};
+  const amrex::InterpolaterBoxCoarsener &coarsener =
+      groupdata.interpolator->BoxCoarsener(ratio);
+  const amrex::EB2::IndexSpace *const index_space = nullptr;
+
+  // Current child (level+1) layout the source band must match; empty on the
+  // finest level.
+  amrex::BoxArray current_child_ba;
+  if (level + 1 < int(patchdata.leveldata.size())) {
+    const auto &childleveldata = patchdata.leveldata.at(level + 1);
+    const auto &childgroupdata =
+        *childleveldata.groupdata.at(groupdata.groupindex);
+    current_child_ba = childgroupdata.mfab.at(0)->boxArray();
+  }
+
+  // ---- Band geometry, built once per (level, centering), and rebuilt when
+  // the child layout changes (operator== short-circuits on the shared m_ref,
+  // so this is O(1) on unchanged grids). ----
+  // A non-null source_band_ba[s] marks the geometry as built; the consumer and
+  // source slots are filled together, each possibly holding an empty BoxArray
+  // (level 0 has no consumer band, the finest level has no source band). This
+  // must run after all levels exist so the source band can see its children.
+  if (!source_band_ba[s] || !source_band_child_ba[s] ||
+      *source_band_child_ba[s] != current_child_ba) {
+    // Consumer band == this level's cf-ghost region (fpc.ba_fine_patch w.r.t.
+    // the parent). Empty at level 0.
+    amrex::BoxArray fba;
+    amrex::DistributionMapping fdm;
+    if (level > 0) {
+      const auto &mfab = *groupdata.mfab.at(0);
+      const amrex::IntVect &nghosts = mfab.nGrowVect();
+      const auto &fgeom = patchdata.amrcore->Geom(level);
+      const auto &cgeom = patchdata.amrcore->Geom(level - 1);
+      const amrex::FabArrayBase::FPinfo &fpc = amrex::FabArrayBase::TheFPinfo(
+          mfab, mfab, nghosts, coarsener, fgeom, cgeom, index_space);
+      fba = fpc.ba_fine_patch;
+      fdm = fpc.dm_patch;
+    }
+    consumer_band_ba[s] = std::make_unique<amrex::BoxArray>(fba);
+    consumer_band_dm[s] = std::make_unique<amrex::DistributionMapping>(fdm);
+
+    // Source band == coarse cells under the next-finer level's cf-ghost
+    // footprint (child fpc.ba_crse_patch). Empty when this is the finest level.
+    amrex::BoxArray cba;
+    amrex::DistributionMapping cdm;
+    if (level + 1 < int(patchdata.leveldata.size())) {
+      const auto &childleveldata = patchdata.leveldata.at(level + 1);
+      const auto &childgroupdata =
+          *childleveldata.groupdata.at(groupdata.groupindex);
+      const auto &childmfab = *childgroupdata.mfab.at(0);
+      const amrex::IntVect &childnghosts = childmfab.nGrowVect();
+      const auto &fgeom = patchdata.amrcore->Geom(level + 1);
+      const auto &cgeom = patchdata.amrcore->Geom(level);
+      const amrex::FabArrayBase::FPinfo &fpc =
+          amrex::FabArrayBase::TheFPinfo(childmfab, childmfab, childnghosts,
+                                         coarsener, fgeom, cgeom, index_space);
+      cba = fpc.ba_crse_patch;
+      cdm = fpc.dm_patch;
+    }
+    source_band_ba[s] = std::make_unique<amrex::BoxArray>(cba);
+    source_band_dm[s] = std::make_unique<amrex::DistributionMapping>(cdm);
+    source_band_child_ba[s] =
+        std::make_unique<amrex::BoxArray>(current_child_ba);
+  }
+
+  // ---- Per-group band MultiFab allocation (idempotent, zero ghost) ----
+  const int numvars = groupdata.numvars;
+  for (int stage = 0; stage < ghext->num_rk_stages; ++stage) {
+    if (!groupdata.ks_consumer_band[stage] && !consumer_band_ba[s]->empty())
+      groupdata.ks_consumer_band[stage] = std::make_unique<amrex::MultiFab>(
+          *consumer_band_ba[s], *consumer_band_dm[s], numvars, 0);
+    // Drop a source band whose layout no longer matches the (rebuilt or
+    // emptied) geometry, then (re)allocate below.
+    if (groupdata.ks_source_band[stage] &&
+        groupdata.ks_source_band[stage]->boxArray() != *source_band_ba[s])
+      groupdata.ks_source_band[stage].reset();
+    if (!groupdata.ks_source_band[stage] && !source_band_ba[s]->empty())
+      groupdata.ks_source_band[stage] = std::make_unique<amrex::MultiFab>(
+          *source_band_ba[s], *source_band_dm[s], numvars, 0);
+  }
+
+  // Old-state bands (single snapshot, share the ks band geometry above).
+  if (!groupdata.old_consumer_band && !consumer_band_ba[s]->empty())
+    groupdata.old_consumer_band = std::make_unique<amrex::MultiFab>(
+        *consumer_band_ba[s], *consumer_band_dm[s], numvars, 0);
+  if (groupdata.old_source_band &&
+      groupdata.old_source_band->boxArray() != *source_band_ba[s])
+    groupdata.old_source_band.reset();
+  if (!groupdata.old_source_band && !source_band_ba[s]->empty())
+    groupdata.old_source_band = std::make_unique<amrex::MultiFab>(
+        *source_band_ba[s], *source_band_dm[s], numvars, 0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+bool all_levels_synchronized() {
+  if (!ghext->use_subcycling)
+    return true;
+  std::optional<rat64> ref;
+  for (const auto &patchdata : ghext->patchdata)
+    for (const auto &leveldata : patchdata.leveldata) {
+      if (!ref)
+        ref = leveldata.iteration;
+      else if (leveldata.iteration != *ref)
+        return false;
+    }
+  return true;
+}
+
+std::string subcycling_band_tag(const band_kind kind, const int stage) {
+  std::ostringstream buf;
+  switch (kind) {
+  case band_kind::ks_consumer:
+    assert(stage >= 0 && stage < max_num_rk_stages);
+    buf << "ksc_s" << std::setw(2) << std::setfill('0') << stage;
+    break;
+  case band_kind::old_consumer:
+    buf << "oldc";
+    break;
+  default:
+    assert(0);
+  }
+  return buf.str();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void GHExt::PatchData::LevelData::GroupData::init_tmp_mfabs() const {
   assert(next_tmp_mfab == 0);
 }
@@ -1286,6 +1429,28 @@ void CactusAmrCore::SetupLevel(const int level, const amrex::BoxArray &ba,
   if (verbose)
 #pragma omp critical
     CCTK_VINFO("SetupLevel patch %d level %d done.", patch, level);
+}
+
+amrex::BoxArray CactusAmrCore::RechopLevel(const int level,
+                                           amrex::BoxArray ba) const {
+  if (level == 0)
+    // Level 0 always covers the full domain: regenerate the canonical
+    // cold-start decomposition (maxSize + optional ChopGrids over the whole
+    // domain). Independent of the checkpoint partition, so it yields larger OR
+    // smaller boxes purely as max_grid_size / NProcs dictate.
+    return MakeBaseGrids();
+
+  // Levels > 0: coalesce the checkpoint union into a (near-)minimal box set
+  // first, so re-chopping can MERGE into larger boxes on scale-down — not just
+  // split into smaller ones — then tile to max_grid_size and load-balance.
+  amrex::BoxList bl = ba.boxList();
+  while (bl.simplify()) // greedily merge abutting boxes to a fixpoint
+    ;
+  ba = amrex::BoxArray(std::move(bl));
+  ba.maxSize(maxGridSize(level)); // tile to current max_grid_size
+  if (refine_grid_layout)         // load-balance to current node count
+    ChopGrids(level, ba, amrex::ParallelDescriptor::NProcs());
+  return ba;
 }
 
 void CactusAmrCore::MakeNewLevelFromScratch(
@@ -1953,7 +2118,7 @@ extern "C" int CarpetX_Startup() {
   CCTK_OverloadGroupStorageDecrease(GroupStorageDecrease);
   CCTK_OverloadQueryGroupStorageB(QueryGroupStorageB);
 
-  if (use_subcycling_wip)
+  if (use_subcycling)
     CCTK_OverloadSyncGroupsByDirI(SyncGroupsByDirISubcycling);
   else
     CCTK_OverloadSyncGroupsByDirI(SyncGroupsByDirI);
@@ -2102,7 +2267,7 @@ int InitGH(cGH *restrict cctkGH) {
     ghext->patchdata.emplace_back(patch);
 
   // Set up use_subcycling
-  ghext->use_subcycling = use_subcycling_wip;
+  ghext->use_subcycling = use_subcycling;
 
   return 0; // unused
 }
